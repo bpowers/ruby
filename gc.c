@@ -477,6 +477,14 @@ typedef struct stack_chunk {
     struct stack_chunk *next;
 } stack_chunk_t;
 
+#define MARK_FIFO_SIZE 32
+
+typedef struct mark_fifo {
+    VALUE queue[MARK_FIFO_SIZE];
+    int index;
+    int length;
+} mark_fifo_t;
+
 typedef struct mark_stack {
     stack_chunk_t *chunk;
     stack_chunk_t *cache;
@@ -484,6 +492,7 @@ typedef struct mark_stack {
     int limit;
     size_t cache_size;
     size_t unused_cache_size;
+    mark_fifo_t fifo;
 } mark_stack_t;
 
 typedef struct rb_heap_struct {
@@ -3917,9 +3926,21 @@ stack_chunk_alloc(void)
 }
 
 static inline int
-is_mark_stack_empty(mark_stack_t *stack)
+is_mark_stack_empty_inner(mark_stack_t *stack)
 {
     return stack->chunk == NULL;
+}
+
+static inline int
+fifo_is_empty(mark_stack_t *stack)
+{
+    return stack->fifo.length == 0;
+}
+
+static inline int
+is_mark_stack_empty(mark_stack_t *stack)
+{
+    return fifo_is_empty(stack) && is_mark_stack_empty_inner(stack);
 }
 
 static size_t
@@ -4004,8 +4025,62 @@ free_stack_chunks(mark_stack_t *stack)
     }
 }
 
+static int
+fifo_push(mark_stack_t *stack, VALUE data)
+{
+    mark_fifo_t *fifo = &stack->fifo;
+    int offset = 0;
+
+    // full, it will get put on the stack
+    if (fifo->length >= MARK_FIFO_SIZE) {
+        return FALSE;
+    }
+
+    offset = (fifo->index + fifo->length) % MARK_FIFO_SIZE;
+
+    GC_ASSERT(offset < MARK_FIFO_SIZE);
+    GC_ASSERT(fifo->queue[offset] == 0);
+
+    fifo->queue[offset] = data;
+    fifo->length++;
+
+    GC_ASSERT(fifo->index >= 0);
+    GC_ASSERT(fifo->index < MARK_FIFO_SIZE);
+    GC_ASSERT(fifo->length >= 0);
+    GC_ASSERT(fifo->length <= MARK_FIFO_SIZE);
+
+    __builtin_prefetch(RBASIC(data));
+
+    return TRUE;
+}
+
+static int
+fifo_pop(mark_stack_t *stack, VALUE *data)
+{
+    mark_fifo_t *fifo = &stack->fifo;
+
+    if (fifo->length == 0) {
+        return FALSE;
+    }
+
+    GC_ASSERT(fifo->index < MARK_FIFO_SIZE);
+    GC_ASSERT(fifo->queue[fifo->index] != 0);
+
+    *data = fifo->queue[fifo->index];
+    fifo->queue[fifo->index] = 0;
+    fifo->index = (fifo->index + 1) % MARK_FIFO_SIZE;
+    fifo->length--;
+
+    GC_ASSERT(fifo->index >= 0);
+    GC_ASSERT(fifo->index < MARK_FIFO_SIZE);
+    GC_ASSERT(fifo->length >= 0);
+    GC_ASSERT(fifo->length < MARK_FIFO_SIZE);
+
+    return TRUE;
+}
+
 static void
-push_mark_stack(mark_stack_t *stack, VALUE data)
+push_mark_stack_inner(mark_stack_t *stack, VALUE data)
 {
     if (stack->index == stack->limit) {
         push_mark_stack_chunk(stack);
@@ -4014,9 +4089,9 @@ push_mark_stack(mark_stack_t *stack, VALUE data)
 }
 
 static int
-pop_mark_stack(mark_stack_t *stack, VALUE *data)
+pop_mark_stack_inner(mark_stack_t *stack, VALUE *data)
 {
-    if (is_mark_stack_empty(stack)) {
+    if (is_mark_stack_empty_inner(stack)) {
         return FALSE;
     }
     if (stack->index == 1) {
@@ -4027,6 +4102,36 @@ pop_mark_stack(mark_stack_t *stack, VALUE *data)
 	*data = stack->chunk->data[--stack->index];
     }
     return TRUE;
+}
+
+static void
+push_mark_stack(mark_stack_t *stack, VALUE data)
+{
+    if (fifo_push(stack, data)) {
+        return;
+    }
+
+    push_mark_stack_inner(stack, data);
+}
+
+static int
+pop_mark_stack(mark_stack_t *stack, VALUE *data)
+{
+    VALUE refill = 0;
+    int success;
+
+    if (fifo_pop(stack, data)) {
+        if (pop_mark_stack_inner(stack, &refill)) {
+            GC_ASSERT(refill);
+            success = fifo_push(stack, refill);
+            refill = 0;
+            GC_ASSERT(success);
+        }
+
+        return TRUE;
+    }
+
+    return pop_mark_stack_inner(stack, data);
 }
 
 #if GC_ENABLE_INCREMENTAL_MARK
@@ -4043,11 +4148,31 @@ invalidate_mark_stack_chunk(stack_chunk_t *chunk, int limit, VALUE obj)
     return FALSE;
 }
 
+static int
+invalidate_fifo_entry(mark_stack_t *stack, VALUE obj)
+{
+    mark_fifo_t *fifo = &stack->fifo;
+    int i;
+
+    for (i = 0; i < MARK_FIFO_SIZE; i++) {
+        if (fifo->queue[i] == obj) {
+            fifo->queue[i] = Qundef;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 static void
 invalidate_mark_stack(mark_stack_t *stack, VALUE obj)
 {
     stack_chunk_t *chunk = stack->chunk;
     int limit = stack->index;
+
+    if (invalidate_fifo_entry(stack, obj)) {
+        return;
+    }
 
     while (chunk) {
 	if (invalidate_mark_stack_chunk(chunk, limit, obj)) return;
