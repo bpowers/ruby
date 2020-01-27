@@ -2,7 +2,7 @@
 
   gc.c -
 
-  $Author$
+  $Author: nagachika $
   created at: Tue Oct  5 09:44:46 JST 1993
 
   Copyright (C) 1993-2007 Yukihiro Matsumoto
@@ -477,7 +477,7 @@ typedef struct stack_chunk {
     struct stack_chunk *next;
 } stack_chunk_t;
 
-#define MARK_FIFO_SIZE 32
+#define MARK_FIFO_SIZE 16
 
 typedef struct mark_fifo {
     VALUE queue[MARK_FIFO_SIZE];
@@ -4025,7 +4025,112 @@ free_stack_chunks(mark_stack_t *stack)
     }
 }
 
-static int
+static void
+prefetch_object(VALUE obj)
+{
+    register RVALUE *any = RANY(obj);
+
+    if (obj == Qundef) {
+      return;
+    }
+
+    if (BUILTIN_TYPE(obj) == T_IMEMO) {
+        return;
+    }
+
+    __builtin_prefetch(RBASIC(any->as.basic.klass));
+
+    switch (BUILTIN_TYPE(obj)) {
+      case T_CLASS:
+      case T_MODULE:
+	if (!RCLASS_EXT(obj)) break;
+        __builtin_prefetch(RCLASS_EXT(obj));
+	__builtin_prefetch(RBASIC(RCLASS_SUPER((VALUE)obj)));
+	break;
+
+      case T_ICLASS:
+	if (!RCLASS_EXT(obj)) break;
+        __builtin_prefetch(RCLASS_EXT(obj));
+	__builtin_prefetch(RBASIC(RCLASS_SUPER((VALUE)obj)));
+	break;
+
+      case T_ARRAY:
+        if (FL_TEST(obj, ELTS_SHARED)) {
+            VALUE root = any->as.array.as.heap.aux.shared;
+            __builtin_prefetch(RBASIC(root));
+	}
+	else {
+	    long i, len = RARRAY_LEN(obj);
+            const VALUE *ptr = RARRAY_CONST_PTR_TRANSIENT(obj);
+	    for (i=0; i < len; i++) {
+                __builtin_prefetch(RBASIC(ptr[i]));
+	    }
+        }
+	break;
+
+      case T_HASH:
+	break;
+
+      case T_STRING:
+	break;
+
+      case T_DATA:
+	break;
+
+      case T_OBJECT:
+        {
+            const VALUE * const ptr = ROBJECT_IVPTR(obj);
+
+            if (ptr) {
+                uint32_t i, len = ROBJECT_NUMIV(obj);
+                for (i  = 0; i < len; i++) {
+                    __builtin_prefetch(RBASIC(ptr[i]));
+                }
+            }
+        }
+	break;
+
+      case T_FILE:
+        break;
+
+      case T_REGEXP:
+        __builtin_prefetch(RBASIC(any->as.regexp.src));
+	break;
+
+      case T_FLOAT:
+      case T_BIGNUM:
+      case T_SYMBOL:
+	break;
+
+      case T_MATCH:
+	break;
+
+      case T_RATIONAL:
+        __builtin_prefetch(RBASIC(any->as.rational.num));
+        __builtin_prefetch(RBASIC(any->as.rational.den));
+	break;
+
+      case T_COMPLEX:
+        __builtin_prefetch(RBASIC(any->as.complex.real));
+        __builtin_prefetch(RBASIC(any->as.complex.imag));
+	break;
+
+      case T_STRUCT:
+	{
+            long i;
+            const long len = RSTRUCT_LEN(obj);
+            const VALUE * const ptr = RSTRUCT_CONST_PTR(obj);
+
+            for (i=0; i<len; i++) {
+                __builtin_prefetch(RBASIC(ptr[i]));
+            }
+	}
+	break;
+    }
+}
+
+
+static inline int
 fifo_push(mark_stack_t *stack, VALUE data)
 {
     mark_fifo_t *fifo = &stack->fifo;
@@ -4049,12 +4154,12 @@ fifo_push(mark_stack_t *stack, VALUE data)
     GC_ASSERT(fifo->length >= 0);
     GC_ASSERT(fifo->length <= MARK_FIFO_SIZE);
 
-    __builtin_prefetch(RBASIC(data));
+    prefetch_object(data);
 
     return TRUE;
 }
 
-static int
+static inline int
 fifo_pop(mark_stack_t *stack, VALUE *data)
 {
     mark_fifo_t *fifo = &stack->fifo;
@@ -4118,15 +4223,13 @@ static int
 pop_mark_stack(mark_stack_t *stack, VALUE *data)
 {
     VALUE refill = 0;
-    int success;
 
     if (fifo_pop(stack, data)) {
-        if (pop_mark_stack_inner(stack, &refill)) {
-            GC_ASSERT(refill);
-            success = fifo_push(stack, refill);
-            refill = 0;
-            GC_ASSERT(success);
+        if (pop_mark_stack_inner(stack, &refill) && refill != Qundef) {
+            fifo_push(stack, refill);
         }
+
+	__builtin_prefetch(stack->fifo.queue[stack->fifo.index]);
 
         return TRUE;
     }
