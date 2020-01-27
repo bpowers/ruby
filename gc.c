@@ -4285,6 +4285,7 @@ static void
 mark_method_entry(rb_objspace_t *objspace, const rb_method_entry_t *me)
 {
     const rb_method_definition_t *def = me->def;
+    __builtin_prefetch(def);
 
     gc_mark(objspace, me->owner);
     gc_mark(objspace, me->defined_class);
@@ -4588,6 +4589,7 @@ static inline void
 gc_mark(rb_objspace_t *objspace, VALUE obj)
 {
     if (!is_markable_object(objspace, obj)) return;
+    __builtin_prefetch(RBASIC(obj));
     gc_mark_ptr(objspace, obj);
 }
 
@@ -4738,6 +4740,9 @@ gc_mark_children(rb_objspace_t *objspace, VALUE obj)
 	    long i, len = RARRAY_LEN(obj);
             const VALUE *ptr = RARRAY_CONST_PTR_TRANSIENT(obj);
 	    for (i=0; i < len; i++) {
+	      __builtin_prefetch(RBASIC(ptr[i]));
+	    }
+	    for (i=0; i < len; i++) {
                 gc_mark(objspace, ptr[i]);
 	    }
 
@@ -4778,6 +4783,9 @@ gc_mark_children(rb_objspace_t *objspace, VALUE obj)
 
             if (ptr) {
                 uint32_t i, len = ROBJECT_NUMIV(obj);
+	    for (i=0; i < len; i++) {
+	      __builtin_prefetch(RBASIC(ptr[i]));
+	    }
                 for (i  = 0; i < len; i++) {
                     gc_mark(objspace, ptr[i]);
                 }
@@ -4832,7 +4840,9 @@ gc_mark_children(rb_objspace_t *objspace, VALUE obj)
             long i;
             const long len = RSTRUCT_LEN(obj);
             const VALUE * const ptr = RSTRUCT_CONST_PTR(obj);
-
+	    for (i=0; i < len; i++) {
+	      __builtin_prefetch(RBASIC(ptr[i]));
+	    }
             for (i=0; i<len; i++) {
                 gc_mark(objspace, ptr[i]);
             }
@@ -6097,6 +6107,7 @@ gc_writebarrier_generational(VALUE a, VALUE b, rb_objspace_t *objspace)
 static void
 gc_mark_from(rb_objspace_t *objspace, VALUE obj, VALUE parent)
 {
+    __builtin_prefetch(RBASIC(obj));
     gc_mark_set_parent(objspace, parent);
     rgengc_check_relation(objspace, obj);
     if (gc_mark_set(objspace, obj) == FALSE) return;
