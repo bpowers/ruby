@@ -92,7 +92,7 @@ void *alloca();
 # endif	/* HAVE_ALLOCA_H */
 #endif /* __GNUC__ */
 
-#if defined HAVE_UINTPTR_T && 0
+#if defined(HAVE_UINTPTR_T) && SIZEOF_UINTPTR_T >= SIZEOF_LONG
 typedef uintptr_t VALUE;
 typedef uintptr_t ID;
 # define SIGNED_VALUE intptr_t
