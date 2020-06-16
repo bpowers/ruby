@@ -1,6 +1,6 @@
 /**********************************************************************
 
-  gc.c -
+  gc.cc -
 
   $Author$
   created at: Tue Oct  5 09:44:46 JST 1993
@@ -14,16 +14,25 @@
 #define rb_data_object_alloc rb_data_object_alloc
 #define rb_data_typed_object_alloc rb_data_typed_object_alloc
 
+#include <sys/sdt.h>
+
+extern "C" {
 #include "ruby/encoding.h"
 #include "ruby/io.h"
+#include "ccan/list/list.hh"
+}
+
+#include "internal.hh"
+
+extern "C" {
 #include "ruby/st.h"
 #include "ruby/re.h"
 #include "ruby/thread.h"
 #include "ruby/util.h"
 #include "ruby/debug.h"
-#include "internal.h"
+#include "internal.hh"
+#include "vm_core.hh"
 #include "eval_intern.h"
-#include "vm_core.h"
 #include "builtin.h"
 #include "gc.h"
 #include "constant.h"
@@ -39,6 +48,12 @@
 #include "debug_counter.h"
 #include "transient_heap.h"
 #include "mjit.h"
+#include "regint.h"
+}
+
+extern "C" {
+size_t rb_hash_ar_table_size();
+}
 
 #undef rb_data_object_wrap
 
@@ -181,9 +196,9 @@ size_mul_or_raise(size_t x, size_t y, VALUE exc)
     else {
         gc_raise(
             exc,
-            "integer overflow: %"PRIuSIZE
-            " * %"PRIuSIZE
-            " > %"PRIuSIZE,
+            "integer overflow: %" PRIuSIZE
+            " * %" PRIuSIZE
+            " > %" PRIuSIZE,
             x, y, SIZE_MAX);
     }
 }
@@ -207,10 +222,10 @@ size_mul_add_or_raise(size_t x, size_t y, size_t z, VALUE exc)
     else {
         gc_raise(
             exc,
-            "integer overflow: %"PRIuSIZE
-            " * %"PRIuSIZE
-            " + %"PRIuSIZE
-            " > %"PRIuSIZE,
+            "integer overflow: %" PRIuSIZE
+            " * %" PRIuSIZE
+            " + %" PRIuSIZE
+            " > %" PRIuSIZE,
             x, y, z, SIZE_MAX);
     }
 }
@@ -234,11 +249,11 @@ size_mul_add_mul_or_raise(size_t x, size_t y, size_t z, size_t w, VALUE exc)
     else {
         gc_raise(
             exc,
-            "integer overflow: %"PRIdSIZE
-            " * %"PRIdSIZE
-            " + %"PRIdSIZE
-            " * %"PRIdSIZE
-            " > %"PRIdSIZE,
+            "integer overflow: %" PRIdSIZE
+            " * %" PRIdSIZE
+            " + %" PRIdSIZE
+            " * %" PRIdSIZE
+            " > %" PRIdSIZE,
             x, y, z, w, SIZE_MAX);
     }
 }
@@ -673,6 +688,11 @@ enum gc_mode {
     gc_mode_sweeping
 };
 
+struct mark_func_data_struct {
+    void *data;
+    void (*mark_func)(VALUE v, void *data);
+};
+
 typedef struct rb_objspace {
     struct {
 	size_t limit;
@@ -711,10 +731,7 @@ typedef struct rb_objspace {
 	rb_atomic_t finalizing;
     } atomic_flags;
 
-    struct mark_func_data_struct {
-	void *data;
-	void (*mark_func)(VALUE v, void *data);
-    } *mark_func_data;
+    struct mark_func_data_struct *mark_func_data;
 
     mark_stack_t mark_stack;
     size_t marked_slots;
@@ -994,6 +1011,8 @@ struct RZombie {
 
 #define nomem_error GET_VM()->special_exceptions[ruby_error_nomemory]
 
+extern "C" {
+
 #if RUBY_MARK_FREE_DEBUG
 int ruby_gc_debug_indent = 0;
 #endif
@@ -1074,6 +1093,8 @@ static inline void gc_prof_sweep_timer_start(rb_objspace_t *);
 static inline void gc_prof_sweep_timer_stop(rb_objspace_t *);
 static inline void gc_prof_set_malloc_info(rb_objspace_t *);
 static inline void gc_prof_set_heap_info(rb_objspace_t *);
+
+}
 
 #define TYPED_UPDATE_IF_MOVED(_objspace, _type, _thing) do { \
     if (gc_object_moved_p(_objspace, (VALUE)_thing)) { \
@@ -1586,7 +1607,7 @@ calloc1(size_t n)
 rb_objspace_t *
 rb_objspace_alloc(void)
 {
-    rb_objspace_t *objspace = calloc1(sizeof(rb_objspace_t));
+    rb_objspace_t *objspace = reinterpret_cast<rb_objspace_t *>(calloc1(sizeof(rb_objspace_t)));
     malloc_limit = gc_params.malloc_limit_min;
     list_head_init(&objspace->eden_heap.pages);
     list_head_init(&objspace->tomb_heap.pages);
@@ -1803,7 +1824,7 @@ heap_page_allocate(rb_objspace_t *objspace)
     }
 
     /* assign heap_page entry */
-    page = calloc1(sizeof(struct heap_page));
+    page = reinterpret_cast<struct heap_page *>(calloc1(sizeof(struct heap_page)));
     if (page == 0) {
         rb_aligned_free(page_body);
 	rb_memerror();
@@ -1833,7 +1854,7 @@ heap_page_allocate(rb_objspace_t *objspace)
 	    hi = mid;
 	}
 	else {
-	    rb_bug("same heap page is allocated: %p at %"PRIuVALUE, (void *)page_body, (VALUE)mid);
+	    rb_bug("same heap page is allocated: %p at %" PRIuVALUE, (void *)page_body, (VALUE)mid);
 	}
     }
 
@@ -1852,7 +1873,7 @@ heap_page_allocate(rb_objspace_t *objspace)
     objspace->profile.total_allocated_pages++;
 
     if (heap_allocated_pages > heap_pages_sorted_length) {
-	rb_bug("heap_page_allocate: allocated(%"PRIdSIZE") > sorted(%"PRIdSIZE")",
+	rb_bug("heap_page_allocate: allocated(%" PRIdSIZE") > sorted(%" PRIdSIZE")",
 	       heap_allocated_pages, heap_pages_sorted_length);
     }
 
@@ -1963,9 +1984,9 @@ heap_extend_pages(rb_objspace_t *objspace, size_t free_slots, size_t total_slots
 
 	if (0) {
 	    fprintf(stderr,
-		    "free_slots(%8"PRIuSIZE")/total_slots(%8"PRIuSIZE")=%1.2f,"
+		    "free_slots(%8" PRIuSIZE")/total_slots(%8" PRIuSIZE")=%1.2f,"
 		    " G(%1.2f), f(%1.2f),"
-		    " used(%8"PRIuSIZE") => next_used(%8"PRIuSIZE")\n",
+		    " used(%8" PRIuSIZE") => next_used(%8" PRIuSIZE")\n",
 		    free_slots, total_slots, free_slots/(double)total_slots,
 		    goal_ratio, f, used, next_used);
 	}
@@ -2299,7 +2320,7 @@ rb_newobj_of(VALUE klass, VALUE flags)
 }
 
 #define UNEXPECTED_NODE(func) \
-    rb_bug(#func"(): GC does not handle T_NODE 0x%x(%p) 0x%"PRIxVALUE, \
+    rb_bug(#func"(): GC does not handle T_NODE 0x%x(%p) 0x%" PRIxVALUE, \
 	   BUILTIN_TYPE(obj), (void*)(obj), RBASIC(obj)->flags)
 
 #undef rb_imemo_new
@@ -2866,7 +2887,7 @@ obj_free(rb_objspace_t *objspace, VALUE obj)
 	return 0;
 
       default:
-	rb_bug("gc_sweep(): unknown data type 0x%x(%p) 0x%"PRIxVALUE,
+	rb_bug("gc_sweep(): unknown data type 0x%x(%p) 0x%" PRIxVALUE,
 	       BUILTIN_TYPE(obj), (void*)obj, RBASIC(obj)->flags);
     }
 
@@ -2927,6 +2948,7 @@ Init_heap(void)
     finalizer_table = st_init_numtable();
 }
 
+extern "C"
 void
 Init_gc_stress(void)
 {
@@ -3204,7 +3226,7 @@ static void
 should_be_callable(VALUE block)
 {
     if (!rb_obj_respond_to(block, idCall, TRUE)) {
-	rb_raise(rb_eArgError, "wrong type argument %"PRIsVALUE" (should be callable)",
+	rb_raise(rb_eArgError, "wrong type argument %" PRIsVALUE" (should be callable)",
 		 rb_obj_class(block));
     }
 }
@@ -3337,7 +3359,7 @@ run_finalizer(rb_objspace_t *objspace, VALUE obj, VALUE table)
     saved.finished = 0;
 
     EC_PUSH_TAG(ec);
-    state = EC_EXEC_TAG();
+    state = static_cast<enum ruby_tag_type>(EC_EXEC_TAG());
     if (state != TAG_NONE) {
 	++saved.finished;	/* skip failed finalizer */
     }
@@ -3407,7 +3429,7 @@ finalize_deferred(rb_objspace_t *objspace)
 static void
 gc_finalize_deferred(void *dmy)
 {
-    rb_objspace_t *objspace = dmy;
+    rb_objspace_t *objspace = reinterpret_cast<rb_objspace_t *>(dmy);
     if (ATOMIC_EXCHANGE(finalizing, 1)) return;
     finalize_deferred(objspace);
     ATOMIC_SET(finalizing, 0);
@@ -3672,9 +3694,9 @@ id2ref(VALUE objid)
     }
 
     if (rb_int_ge(objid, objspace->next_object_id)) {
-        rb_raise(rb_eRangeError, "%+"PRIsVALUE" is not id value", rb_int2str(objid, 10));
+        rb_raise(rb_eRangeError, "%+" PRIsVALUE" is not id value", rb_int2str(objid, 10));
     } else {
-        rb_raise(rb_eRangeError, "%+"PRIsVALUE" is recycled object", rb_int2str(objid, 10));
+        rb_raise(rb_eRangeError, "%+" PRIsVALUE" is recycled object", rb_int2str(objid, 10));
     }
 }
 
@@ -3803,8 +3825,6 @@ rb_obj_id(VALUE obj)
     return rb_find_object_id(obj, cached_object_id);
 }
 
-#include "regint.h"
-
 static size_t
 obj_memsize_of(VALUE obj, int use_all_types)
 {
@@ -3862,7 +3882,6 @@ obj_memsize_of(VALUE obj, int use_all_types)
       case T_HASH:
         if (RHASH_AR_TABLE_P(obj)) {
             if (RHASH_AR_TABLE(obj) != NULL) {
-                size_t rb_hash_ar_table_size();
                 size += rb_hash_ar_table_size();
             }
 	}
@@ -4431,7 +4450,7 @@ stack_chunk_alloc(void)
 {
     stack_chunk_t *res;
 
-    res = malloc(sizeof(stack_chunk_t));
+    res = reinterpret_cast<stack_chunk_t *>(malloc(sizeof(stack_chunk_t)));
     if (!res)
         rb_memerror();
 
@@ -4927,7 +4946,7 @@ static enum rb_id_table_iterator_result
 mark_const_entry_i(VALUE value, void *data)
 {
     const rb_const_entry_t *ce = (const rb_const_entry_t *)value;
-    rb_objspace_t *objspace = data;
+    rb_objspace_t *objspace = reinterpret_cast<rb_objspace_t *>(data);
 
     gc_mark(objspace, ce->value);
     gc_mark(objspace, ce->file);
@@ -6158,17 +6177,17 @@ gc_verify_internal_consistency(rb_objspace_t *objspace)
 	if (objspace_live_slots(objspace) != data.live_object_count) {
 	    fprintf(stderr, "heap_pages_final_slots: %d, objspace->profile.total_freed_objects: %d\n",
 		    (int)heap_pages_final_slots, (int)objspace->profile.total_freed_objects);
-	    rb_bug("inconsistent live slot number: expect %"PRIuSIZE", but %"PRIuSIZE".", objspace_live_slots(objspace), data.live_object_count);
+	    rb_bug("inconsistent live slot number: expect %" PRIuSIZE", but %" PRIuSIZE".", objspace_live_slots(objspace), data.live_object_count);
 	}
     }
 
 #if USE_RGENGC
     if (!is_marking(objspace)) {
 	if (objspace->rgengc.old_objects != data.old_object_count) {
-	    rb_bug("inconsistent old slot number: expect %"PRIuSIZE", but %"PRIuSIZE".", objspace->rgengc.old_objects, data.old_object_count);
+	    rb_bug("inconsistent old slot number: expect %" PRIuSIZE", but %" PRIuSIZE".", objspace->rgengc.old_objects, data.old_object_count);
 	}
 	if (objspace->rgengc.uncollectible_wb_unprotected_objects != data.remembered_shady_count) {
-	    rb_bug("inconsistent old slot number: expect %"PRIuSIZE", but %"PRIuSIZE".", objspace->rgengc.uncollectible_wb_unprotected_objects, data.remembered_shady_count);
+	    rb_bug("inconsistent old slot number: expect %" PRIuSIZE", but %" PRIuSIZE".", objspace->rgengc.uncollectible_wb_unprotected_objects, data.remembered_shady_count);
 	}
     }
 #endif
@@ -6188,9 +6207,9 @@ gc_verify_internal_consistency(rb_objspace_t *objspace)
 	    heap_pages_final_slots != list_count) {
 
 	    rb_bug("inconsistent finalizing object count:\n"
-		   "  expect %"PRIuSIZE"\n"
-		   "  but    %"PRIuSIZE" zombies\n"
-		   "  heap_pages_deferred_final list has %"PRIuSIZE" items.",
+		   "  expect %" PRIuSIZE"\n"
+		   "  but    %" PRIuSIZE" zombies\n"
+		   "  heap_pages_deferred_final list has %" PRIuSIZE" items.",
 		   heap_pages_final_slots,
 		   data.zombie_object_count,
 		   list_count);
@@ -7174,11 +7193,11 @@ gc_reset_malloc_info(rb_objspace_t *objspace)
 
 	if (0) {
 	    if (old_limit != malloc_limit) {
-		fprintf(stderr, "[%"PRIuSIZE"] malloc_limit: %"PRIuSIZE" -> %"PRIuSIZE"\n",
+		fprintf(stderr, "[%" PRIuSIZE"] malloc_limit: %" PRIuSIZE" -> %" PRIuSIZE"\n",
 			rb_gc_count(), old_limit, malloc_limit);
 	    }
 	    else {
-		fprintf(stderr, "[%"PRIuSIZE"] malloc_limit: not changed (%"PRIuSIZE")\n",
+		fprintf(stderr, "[%" PRIuSIZE"] malloc_limit: not changed (%" PRIuSIZE")\n",
 			rb_gc_count(), malloc_limit);
 	    }
 	}
@@ -7425,7 +7444,7 @@ gc_record(rb_objspace_t *objspace, int direction, const char *event)
 	gc_current_status_fill(objspace, current_gc_status);
 #if 1
 	/* [last mutator time] [gc time] [event] */
-	fprintf(stderr, "%"PRItick"\t%"PRItick"\t%s\t[%s->%s|%c]\n",
+	fprintf(stderr, "%" PRItick"\t%" PRItick"\t%s\t[%s->%s|%c]\n",
 		enter_tick - last_exit_tick,
 		exit_tick - enter_tick,
 		event,
@@ -7434,7 +7453,7 @@ gc_record(rb_objspace_t *objspace, int direction, const char *event)
 	last_exit_tick = exit_tick;
 #else
 	/* [enter_tick] [gc time] [event] */
-	fprintf(stderr, "%"PRItick"\t%"PRItick"\t%s\t[%s->%s|%c]\n",
+	fprintf(stderr, "%" PRItick"\t%" PRItick"\t%s\t[%s->%s|%c]\n",
 		enter_tick,
 		exit_tick - enter_tick,
 		event,
@@ -7772,7 +7791,8 @@ allocate_page_list(rb_objspace_t *objspace, page_compare_func_t *comparator)
 {
     size_t total_pages = heap_eden->total_pages;
     size_t size = size_mul_or_raise(total_pages, sizeof(struct heap_page *), rb_eRuntimeError);
-    struct heap_page *page = 0, **page_list = malloc(size);
+    struct heap_page *page = 0;
+    struct heap_page **page_list = reinterpret_cast<struct heap_page **>(malloc(size));
     int i = 0;
 
     list_for_each(&heap_eden->pages, page, page_node) {
@@ -8808,7 +8828,7 @@ gc_info_decode(rb_objspace_t *objspace, const VALUE hash_or_key, const int orig_
 #undef SET
 
     if (!NIL_P(key)) {/* matched key should return above */
-        rb_raise(rb_eArgError, "unknown key: %"PRIsVALUE, rb_sym2str(key));
+        rb_raise(rb_eArgError, "unknown key: %" PRIsVALUE, rb_sym2str(key));
     }
 
     return hash;
@@ -9025,7 +9045,7 @@ compat_key(VALUE key)
 	static int warned = 0;
 	if (warned == 0) {
 	    rb_warn("GC.stat keys were changed from Ruby 2.1. "
-		    "In this case, you refer to obsolete `%"PRIsVALUE"' (new key is `%"PRIsVALUE"'). "
+		    "In this case, you refer to obsolete `%" PRIsVALUE"' (new key is `%" PRIsVALUE"'). "
 		    "Please check <https://bugs.ruby-lang.org/issues/9924> for more information.",
 		    key, new_key);
 	    warned = 1;
@@ -9134,7 +9154,7 @@ gc_stat_internal(VALUE hash_or_sym)
 	    key = new_key;
 	    goto again;
 	}
-	rb_raise(rb_eArgError, "unknown key: %"PRIsVALUE, rb_sym2str(key));
+	rb_raise(rb_eArgError, "unknown key: %" PRIsVALUE, rb_sym2str(key));
     }
 
 #if defined(RGENGC_PROFILE) && RGENGC_PROFILE >= 2
@@ -9306,14 +9326,14 @@ get_envparam_size(const char *name, size_t *default_value, size_t lower_bound)
 	}
 	if (val > 0 && (size_t)val > lower_bound) {
 	    if (RTEST(ruby_verbose)) {
-		fprintf(stderr, "%s=%"PRIdSIZE" (default value: %"PRIuSIZE")\n", name, val, *default_value);
+		fprintf(stderr, "%s=%" PRIdSIZE " (default value: %" PRIuSIZE ")\n", name, val, *default_value);
 	    }
 	    *default_value = (size_t)val;
 	    return 1;
 	}
 	else {
 	    if (RTEST(ruby_verbose)) {
-		fprintf(stderr, "%s=%"PRIdSIZE" (default value: %"PRIuSIZE") is ignored because it must be greater than %"PRIuSIZE".\n",
+		fprintf(stderr, "%s=%" PRIdSIZE " (default value: %" PRIuSIZE ") is ignored because it must be greater than %" PRIuSIZE ".\n",
 			name, val, *default_value, lower_bound);
 	    }
 	    return 0;
@@ -9528,7 +9548,7 @@ struct gc_raise_tag {
 static void *
 gc_vraise(void *ptr)
 {
-    struct gc_raise_tag *argv = ptr;
+    struct gc_raise_tag *argv = reinterpret_cast<struct gc_raise_tag *>(ptr);
     rb_vraise(argv->exc, argv->fmt, *argv->ap);
     UNREACHABLE_RETURN(NULL);
 }
@@ -9602,7 +9622,7 @@ rb_memerror(void)
 
     if (0) {
         // Print out pid, sleep, so you can attach debugger to see what went wrong:
-        fprintf(stderr, "rb_memerror pid=%"PRI_PIDT_PREFIX"d\n", getpid());
+        fprintf(stderr, "rb_memerror pid=%" PRI_PIDT_PREFIX"d\n", getpid());
         sleep(60);
     }
 
@@ -9966,6 +9986,7 @@ mmalloc_info_file_i(st_data_t key, st_data_t val, st_data_t dmy)
 }
 
 __attribute__((destructor))
+extern "C"
 void
 rb_malloc_info_show_results(void)
 {
@@ -9994,6 +10015,7 @@ rb_malloc_info_show_results(void)
     }
 }
 #else
+extern "C"
 void
 rb_malloc_info_show_results(void)
 {
@@ -10093,7 +10115,7 @@ void
 ruby_malloc_size_overflow(size_t count, size_t elsize)
 {
     rb_raise(rb_eArgError,
-	     "malloc: possible integer overflow (%"PRIuSIZE"*%"PRIuSIZE")",
+	     "malloc: possible integer overflow (%" PRIuSIZE "*%" PRIuSIZE ")",
 	     count, elsize);
 }
 
@@ -10255,7 +10277,7 @@ rb_alloc_tmp_buffer_with_count(volatile VALUE *store, size_t size, size_t cnt)
     *store = imemo;
     ptr = ruby_xmalloc0(size);
     tmpbuf = (rb_imemo_tmpbuf_t *)imemo;
-    tmpbuf->ptr = ptr;
+    tmpbuf->ptr = reinterpret_cast<VALUE *>(ptr);
     tmpbuf->cnt = cnt;
     return ptr;
 }
@@ -10353,7 +10375,7 @@ wmap_mark_map(st_data_t key, st_data_t val, st_data_t arg)
 static void
 wmap_compact(void *ptr)
 {
-    struct weakmap *w = ptr;
+    struct weakmap *w = reinterpret_cast<struct weakmap *>(ptr);
     if (w->wmap2obj) rb_gc_update_tbl_refs(w->wmap2obj);
     if (w->obj2wmap) rb_gc_update_tbl_refs(w->obj2wmap);
     w->final = rb_gc_location(w->final);
@@ -10362,7 +10384,7 @@ wmap_compact(void *ptr)
 static void
 wmap_mark(void *ptr)
 {
-    struct weakmap *w = ptr;
+    struct weakmap *w = reinterpret_cast<struct weakmap *>(ptr);
 #if WMAP_DELETE_DEAD_OBJECT_IN_MARK
     if (w->obj2wmap) st_foreach(w->obj2wmap, wmap_mark_map, (st_data_t)&rb_objspace);
 #endif
@@ -10380,7 +10402,7 @@ wmap_free_map(st_data_t key, st_data_t val, st_data_t arg)
 static void
 wmap_free(void *ptr)
 {
-    struct weakmap *w = ptr;
+    struct weakmap *w = reinterpret_cast<struct weakmap *>(ptr);
     st_foreach(w->obj2wmap, wmap_free_map, 0);
     st_free_table(w->obj2wmap);
     st_free_table(w->wmap2obj);
@@ -10398,7 +10420,7 @@ static size_t
 wmap_memsize(const void *ptr)
 {
     size_t size;
-    const struct weakmap *w = ptr;
+    const struct weakmap *w = reinterpret_cast<const struct weakmap *>(ptr);
     size = sizeof(*w);
     size += st_memsize(w->obj2wmap);
     size += st_memsize(w->wmap2obj);
@@ -10532,7 +10554,7 @@ wmap_inspect(VALUE self)
     struct weakmap *w;
 
     TypedData_Get_Struct(self, struct weakmap, &weakmap_type, w);
-    str = rb_sprintf("-<%"PRIsVALUE":%p", c, (void *)self);
+    str = rb_sprintf("-<%" PRIsVALUE":%p", c, (void *)self);
     if (w->wmap2obj) {
 	st_foreach(w->wmap2obj, wmap_inspect_i, str);
     }
@@ -10676,7 +10698,7 @@ wmap_aset_update(st_data_t *key, st_data_t *val, st_data_t arg, int existing)
     else {
 	optr = 0;
 	size = 1;
-	ptr = ruby_xmalloc0(2 * sizeof(VALUE));
+	ptr = reinterpret_cast<VALUE *>(ruby_xmalloc0(2 * sizeof(VALUE)));
     }
     ptr[0] = size;
     ptr[size] = (VALUE)arg;
@@ -10816,14 +10838,14 @@ gc_prof_setup_new_record(rb_objspace_t *objspace, int reason)
 
 	if (!objspace->profile.records) {
 	    objspace->profile.size = GC_PROFILE_RECORD_DEFAULT_SIZE;
-	    objspace->profile.records = malloc(xmalloc2_size(sizeof(gc_profile_record), objspace->profile.size));
+	    objspace->profile.records = reinterpret_cast<gc_profile_record *>(malloc(xmalloc2_size(sizeof(gc_profile_record), objspace->profile.size)));
 	}
 	if (index >= objspace->profile.size) {
 	    void *ptr;
 	    objspace->profile.size += 1000;
 	    ptr = realloc(objspace->profile.records, xmalloc2_size(sizeof(gc_profile_record), objspace->profile.size));
 	    if (!ptr) rb_memerror();
-	    objspace->profile.records = ptr;
+	    objspace->profile.records = reinterpret_cast<gc_profile_record *>(ptr);
 	}
 	if (!objspace->profile.records) {
 	    rb_bug("gc_profile malloc or realloc miss");
@@ -11074,8 +11096,8 @@ gc_profile_record_get(VALUE _)
 	rb_hash_aset(prof, ID2SYM(rb_intern("GC_FLAGS")), gc_info_decode(0, rb_hash_new(), record->flags));
         rb_hash_aset(prof, ID2SYM(rb_intern("GC_TIME")), DBL2NUM(record->gc_time));
         rb_hash_aset(prof, ID2SYM(rb_intern("GC_INVOKE_TIME")), DBL2NUM(record->gc_invoke_time));
-        rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_USE_SIZE")), SIZET2NUM(record->heap_use_size));
-        rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_TOTAL_SIZE")), SIZET2NUM(record->heap_total_size));
+        rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_USE_SIZE ")), SIZET2NUM(record->heap_use_size));
+        rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_TOTAL_SIZE ")), SIZET2NUM(record->heap_total_size));
         rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_TOTAL_OBJECTS")), SIZET2NUM(record->heap_total_objects));
         rb_hash_aset(prof, ID2SYM(rb_intern("GC_IS_MARKED")), Qtrue);
 #if GC_PROFILE_MORE_DETAIL
@@ -11090,7 +11112,7 @@ gc_profile_record_get(VALUE _)
 	rb_hash_aset(prof, ID2SYM(rb_intern("REMOVING_OBJECTS")), SIZET2NUM(record->removing_objects));
 	rb_hash_aset(prof, ID2SYM(rb_intern("EMPTY_OBJECTS")), SIZET2NUM(record->empty_objects));
 
-	rb_hash_aset(prof, ID2SYM(rb_intern("HAVE_FINALIZE")), (record->flags & GPR_FLAG_HAVE_FINALIZE) ? Qtrue : Qfalse);
+	rb_hash_aset(prof, ID2SYM(rb_intern("HAVE_FINALIZE ")), (record->flags & GPR_FLAG_HAVE_FINALIZE) ? Qtrue : Qfalse);
 #endif
 
 #if RGENGC_PROFILE > 0
@@ -11149,12 +11171,12 @@ gc_profile_dump_on(VALUE out, VALUE (*append)(VALUE, VALUE))
 	size_t i;
 	const gc_profile_record *record;
 
-	append(out, rb_sprintf("GC %"PRIuSIZE" invokes.\n", objspace->profile.count));
+	append(out, rb_sprintf("GC %" PRIuSIZE " invokes.\n", objspace->profile.count));
 	append(out, rb_str_new_cstr("Index    Invoke Time(sec)       Use Size(byte)     Total Size(byte)         Total Object                    GC Time(ms)\n"));
 
 	for (i = 0; i < count; i++) {
 	    record = &objspace->profile.records[i];
-	    append(out, rb_sprintf("%5"PRIuSIZE" %19.3f %20"PRIuSIZE" %20"PRIuSIZE" %20"PRIuSIZE" %30.20f\n",
+	    append(out, rb_sprintf("%5" PRIuSIZE " %19.3f %20" PRIuSIZE " %20" PRIuSIZE " %20" PRIuSIZE " %30.20f\n",
 				   i+1, record->gc_invoke_time, record->heap_use_size,
 				   record->heap_total_size, record->heap_total_objects, record->gc_time*1000));
 	}
@@ -11178,13 +11200,13 @@ gc_profile_dump_on(VALUE out, VALUE (*append)(VALUE, VALUE))
 
 	for (i = 0; i < count; i++) {
 	    record = &objspace->profile.records[i];
-	    append(out, rb_sprintf("%5"PRIuSIZE" %4s/%c/%6s%c %13"PRIuSIZE" %15"PRIuSIZE
+	    append(out, rb_sprintf("%5" PRIuSIZE " %4s/%c/%6s%c %13" PRIuSIZE " %15" PRIuSIZE
 #if CALC_EXACT_MALLOC_SIZE
-				   " %15"PRIuSIZE
+				   " %15" PRIuSIZE
 #endif
-				   " %9"PRIuSIZE" %17.12f %17.12f %17.12f %10"PRIuSIZE" %10"PRIuSIZE" %10"PRIuSIZE" %10"PRIuSIZE
+				   " %9" PRIuSIZE " %17.12f %17.12f %17.12f %10" PRIuSIZE " %10" PRIuSIZE " %10" PRIuSIZE " %10" PRIuSIZE
 #if RGENGC_PROFILE
-				   "%10"PRIuSIZE" %10"PRIuSIZE" %10"PRIuSIZE
+				   "%10" PRIuSIZE " %10" PRIuSIZE " %10" PRIuSIZE
 #endif
 #if GC_PROFILE_DETAIL_MEMORY
 				   "%11ld %8ld %8ld"
@@ -11393,6 +11415,7 @@ obj_type_name(VALUE obj)
     return type_name(TYPE(obj), obj);
 }
 
+extern "C"
 const char *
 rb_method_type_name(rb_method_type_t type)
 {
@@ -11613,7 +11636,7 @@ rb_raw_obj_info(char *buff, const int buff_size, VALUE obj)
 		if (me->def) {
                     APPENDF((BUFF_ARGS, "(called_id: %s, type: %s, alias: %d, owner: %s, defined_class: %s)",
 			     rb_id2name(me->called_id),
-                             rb_method_type_name(me->def->type),
+                             rb_method_type_name(static_cast<rb_method_type_t>(me->def->type)),
 			     me->def->alias_count,
 			     obj_info(me->owner),
                              obj_info(me->defined_class)));
@@ -11847,6 +11870,7 @@ rb_gcdebug_remove_stress_to_class(int argc, VALUE *argv, VALUE self)
 
 #include "gc.rbinc"
 
+extern "C"
 void
 Init_GC(void)
 {
@@ -11859,7 +11883,7 @@ Init_GC(void)
     load_gc();
 
     gc_constants = rb_hash_new();
-    rb_hash_aset(gc_constants, ID2SYM(rb_intern("RVALUE_SIZE")), SIZET2NUM(sizeof(RVALUE)));
+    rb_hash_aset(gc_constants, ID2SYM(rb_intern("RVALUE_SIZE ")), SIZET2NUM(sizeof(RVALUE)));
     rb_hash_aset(gc_constants, ID2SYM(rb_intern("HEAP_PAGE_OBJ_LIMIT")), SIZET2NUM(HEAP_PAGE_OBJ_LIMIT));
     rb_hash_aset(gc_constants, ID2SYM(rb_intern("HEAP_PAGE_BITMAP_SIZE")), SIZET2NUM(HEAP_PAGE_BITMAP_SIZE));
     rb_hash_aset(gc_constants, ID2SYM(rb_intern("HEAP_PAGE_BITMAP_PLANES")), SIZET2NUM(HEAP_PAGE_BITMAP_PLANES));

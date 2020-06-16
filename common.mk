@@ -100,6 +100,7 @@ COMMONOBJS    = array.$(OBJEXT) \
 		eval.$(OBJEXT) \
 		file.$(OBJEXT) \
 		gc.$(OBJEXT) \
+		alloc.$(OBJEXT) \
 		hash.$(OBJEXT) \
 		inits.$(OBJEXT) \
 		io.$(OBJEXT) \
@@ -358,7 +359,7 @@ ruby.imp: $(COMMONOBJS)
 	$(NM) -Pgp $(COMMONOBJS) | \
 	awk 'BEGIN{print "#!"}; $$2~/^[BDT]$$/&&$$1!~/^$(SYMBOL_PREFIX)(Init_|InitVM_|ruby_static_id_|.*_threadptr_|rb_ec_)|^\./{print $$1}'; \
 	($(CHDIR) $(srcdir) && \
-	 exec sed -n '/^MJIT_FUNC_EXPORTED/!d;N;s/.*\n\(rb_[a-zA-Z_0-9]*\).*/$(SYMBOL_PREFIX)\1/p' cont.c gc.c thread*c vm*.c) \
+	 exec sed -n '/^MJIT_FUNC_EXPORTED/!d;N;s/.*\n\(rb_[a-zA-Z_0-9]*\).*/$(SYMBOL_PREFIX)\1/p' cont.c gc.cc alloc.cc thread*c vm*.c) \
 	} | \
 	sort -u -o $@
 
@@ -2074,7 +2075,7 @@ gc.$(OBJEXT): {$(VPATH)}debug_counter.h
 gc.$(OBJEXT): {$(VPATH)}defines.h
 gc.$(OBJEXT): {$(VPATH)}encoding.h
 gc.$(OBJEXT): {$(VPATH)}eval_intern.h
-gc.$(OBJEXT): {$(VPATH)}gc.c
+gc.$(OBJEXT): {$(VPATH)}gc.cc
 gc.$(OBJEXT): {$(VPATH)}gc.h
 gc.$(OBJEXT): {$(VPATH)}gc.rbinc
 gc.$(OBJEXT): {$(VPATH)}id.h

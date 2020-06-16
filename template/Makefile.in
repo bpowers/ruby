@@ -20,6 +20,7 @@ PLATFORM_DIR = @PLATFORM_DIR@
 
 CC_WRAPPER = @XCC_WRAPPER@
 CC = @CC@
+CXX = @CXX@
 CPP = @CPP@
 LD = @LD@
 YACC = bison
@@ -76,7 +77,9 @@ COUTFLAG = @COUTFLAG@$(empty)
 CPPOUTFLAG = $(COUTFLAG)
 ARCH_FLAG = @ARCH_FLAG@
 CFLAGS_NO_ARCH = @CFLAGS@
+CXXFLAGS_NO_ARCH = @CXXFLAGS@
 CFLAGS = $(CFLAGS_NO_ARCH) $(ARCH_FLAG)
+CXXFLAGS = $(subst gnu99,gnu++14,$(CFLAGS)) -Wno-reorder-init-list -Wno-deprecated-register
 cflags = @cflags@
 optflags = @optflags@
 debugflags = @debugflags@
@@ -181,6 +184,7 @@ DTRACE_REBUILD_OBJS = $(DTRACE_REBUILD:yes=$(DTRACE_DEPENDENT_OBJS))
 DTRACE_DEPENDENT_OBJS = array.$(OBJEXT) \
 			eval.$(OBJEXT) \
 			gc.$(OBJEXT) \
+			alloc.$(OBJEXT) \
 			hash.$(OBJEXT) \
 			load.$(OBJEXT) \
 			object.$(OBJEXT) \
@@ -416,6 +420,10 @@ $(srcdir)/enc/jis/props.h: enc/jis/props.kwd
 .c.@OBJEXT@:
 	@$(ECHO) compiling $<
 	$(Q) $(CC) $(CFLAGS) $(XCFLAGS) $(CPPFLAGS) $(COUTFLAG)$@ -c $<
+
+.cc.@OBJEXT@:
+	@$(ECHO) compiling $<
+	$(Q) $(CXX) $(CXXFLAGS) $(XCFLAGS) $(CPPFLAGS) $(COUTFLAG)$@ -c $<
 
 .$(ASMEXT).@OBJEXT@:
 	@$(ECHO) assembling $<
